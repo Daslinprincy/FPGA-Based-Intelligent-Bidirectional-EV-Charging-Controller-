@@ -1,0 +1,586 @@
+Code 1: Frontend (HTML, CSS & JavaScript)
+
+This code develops a web-based EV Battery Monitoring Dashboard that displays real-time battery parameters such as State of Charge (SOC), voltage, current, temperature, and cycle count. It provides a graphical battery indicator and allows users to control charging, discharging, and stop operations. The dashboard continuously fetches battery data from the backend and updates the display dynamically.
+
+
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EV Battery Monitor</title>
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background: #0f0f0f;
+        color: #e0e0e0;
+        font-family: monospace;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+      .dashboard {
+        width: 100%;
+        max-width: 620px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      h1 {
+        font-size: 15px;
+        text-align: center;
+        color: #00ff88;
+        letter-spacing: 1px;
+      }
+      .status {
+        background: #1a1a1a;
+        border: 1px solid #2a2a2a;
+        border-radius: 8px;
+        padding: 9px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .status-left {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        color: #777;
+      }
+      .conn-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        background: #444;
+        transition: background 0.4s;
+      }
+      .conn-dot.connected {
+        background: #00ff88;
+        animation: pulse 2s ease-out infinite;
+      }
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.6);
+        }
+        70% {
+          box-shadow: 0 0 0 6px rgba(0, 255, 136, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(0, 255, 136, 0);
+        }
+      }
+      .mode-badge {
+        font-size: 10px;
+        font-weight: bold;
+        letter-spacing: 1px;
+        padding: 3px 9px;
+        border-radius: 4px;
+        border: 1px solid #2a2a2a;
+        color: #444;
+        transition:
+          color 0.3s,
+          border-color 0.3s,
+          background 0.3s;
+      }
+      .mode-badge.charging {
+        color: #00ff88;
+        border-color: #00ff8840;
+        background: #00ff8810;
+      }
+      .mode-badge.discharging {
+        color: #ffaa00;
+        border-color: #ffaa0040;
+        background: #ffaa0010;
+      }
+      .battery-wrap {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        padding: 18px 0 10px;
+      }
+      .battery-svg {
+        display: block;
+      }
+      .soc-sub {
+        font-size: 10px;
+        color: #555;
+        letter-spacing: 1px;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+      }
+      .metric {
+        background: #1a1a1a;
+        border: 1px solid #2a2a2a;
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      .metric .lbl {
+        font-size: 9px;
+        color: #555;
+        letter-spacing: 0.5px;
+        margin-bottom: 4px;
+      }
+      .metric .val {
+        font-size: 18px;
+        font-weight: bold;
+        color: #fff;
+        transition: color 0.4s;
+      }
+      .metric .val.positive {
+        color: #00ff88;
+      }
+      .metric .val.negative {
+        color: #ffaa00;
+      }
+      .panels {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .panel {
+        background: #1a1a1a;
+        border: 1px solid #2a2a2a;
+        border-radius: 8px;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .panel-title {
+        font-size: 10px;
+        letter-spacing: 1px;
+        color: #555;
+      }
+      .panel-soc {
+        font-size: 28px;
+        font-weight: bold;
+        color: #fff;
+      }
+      .panel-soc span {
+        font-size: 13px;
+        color: #555;
+        font-weight: normal;
+      }
+      .discharge-input-row {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .discharge-input-row label {
+        font-size: 10px;
+        color: #555;
+        letter-spacing: 0.3px;
+      }
+      .discharge-input-row input {
+        background: #111;
+        border: 1px solid #333;
+        border-radius: 6px;
+        color: #e0e0e0;
+        font-family: monospace;
+        font-size: 15px;
+        padding: 8px 10px;
+        width: 100%;
+        outline: none;
+        transition: border-color 0.2s;
+      }
+      .discharge-input-row input:focus {
+        border-color: #ffaa00;
+      }
+      .panel-progress {
+        font-size: 10px;
+        color: #555;
+        min-height: 14px;
+      }
+      .panel-progress.active {
+        color: #ffaa00;
+      }
+      .btn {
+        padding: 11px;
+        border-radius: 7px;
+        border: 1px solid #333;
+        background: #141414;
+        color: #888;
+        font-family: monospace;
+        font-size: 12px;
+        cursor: pointer;
+        transition:
+          background 0.15s,
+          border-color 0.15s,
+          color 0.15s;
+        text-align: center;
+      }
+      .btn:hover {
+        border-color: #555;
+        color: #e0e0e0;
+      }
+      .btn.charge-active {
+        background: #021a0e;
+        border-color: #00ff88;
+        color: #00ff88;
+      }
+      .btn.discharge-active {
+        background: #1a1000;
+        border-color: #ffaa00;
+        color: #ffaa00;
+      }
+      .btn-stop {
+        background: #1a0000;
+        border: 1px solid #aa2222;
+        color: #ff4444;
+        border-radius: 7px;
+        padding: 13px;
+        font-family: monospace;
+        font-size: 13px;
+        cursor: pointer;
+        width: 100%;
+        transition:
+          background 0.15s,
+          border-color 0.15s;
+      }
+      .btn-stop:hover {
+        background: #220000;
+        border-color: #ff4444;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dashboard">
+      <h1>⚡ EV Battery Interface</h1>
+      <div class="status">
+        <div class="status-left">
+          <span class="conn-dot" id="conn-dot"></span>
+          <span id="conn-label">FPGA IDLE</span>
+        </div>
+        <span class="mode-badge" id="mode-badge">IDLE</span>
+      </div>
+      <div class="battery-wrap">
+        <svg class="battery-svg" width="120" height="56" viewBox="0 0 120 56">
+          <rect
+            x="2"
+            y="6"
+            width="108"
+            height="44"
+            rx="6"
+            ry="6"
+            fill="none"
+            stroke="#333"
+            stroke-width="2"
+          />
+          <rect
+            x="110"
+            y="18"
+            width="8"
+            height="20"
+            rx="3"
+            ry="3"
+            fill="#333"
+          />
+          <clipPath id="batt-clip">
+            <rect x="5" y="9" width="102" height="38" rx="4" ry="4" />
+          </clipPath>
+          <rect
+            id="batt-fill"
+            x="5"
+            y="9"
+            width="0"
+            height="38"
+            rx="4"
+            ry="4"
+            fill="#00ff88"
+            clip-path="url(#batt-clip)"
+            style="
+              transition:
+                width 1.5s cubic-bezier(0.4, 0, 0.2, 1),
+                fill 0.5s;
+            "
+          />
+          <text
+            id="batt-text"
+            x="57"
+            y="34"
+            text-anchor="middle"
+            fill="#fff"
+            font-family="monospace"
+            font-size="16"
+            font-weight="bold"
+          >
+            —
+          </text>
+        </svg>
+        <div class="soc-sub">STATE OF CHARGE</div>
+      </div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="lbl">VOLTAGE</div>
+          <div class="val" id="voltage">—</div>
+        </div>
+        <div class="metric">
+          <div class="lbl">CURRENT</div>
+          <div class="val" id="current">—</div>
+        </div>
+        <div class="metric">
+          <div class="lbl">TEMPERATURE</div>
+          <div class="val" id="temp">—</div>
+        </div>
+        <div class="metric">
+          <div class="lbl">CYCLES</div>
+          <div class="val" id="cycles">847</div>
+        </div>
+      </div>
+      <div class="panels">
+        <div class="panel">
+          <div class="panel-title">CHARGE</div>
+          <div>
+            <div class="panel-soc" id="charge-soc">—<span> %</span></div>
+            <div class="soc-sub" style="margin-top: 2px">
+              current battery level
+            </div>
+          </div>
+          <button class="btn" id="btn-charge">▶ Start Charging</button>
+        </div>
+        <div class="panel">
+          <div class="panel-title">DISCHARGE</div>
+          <div>
+            <div class="panel-soc" id="discharge-soc">—<span> %</span></div>
+            <div class="soc-sub" style="margin-top: 2px">
+              current battery level
+            </div>
+          </div>
+          <div class="discharge-input-row">
+            <label for="discharge-amt">How many % to discharge?</label>
+            <input
+              type="number"
+              id="discharge-amt"
+              min="1"
+              max="90"
+              placeholder="e.g. 20"
+            />
+          </div>
+          <div class="panel-progress" id="discharge-progress"></div>
+          <button class="btn" id="btn-discharge">▶ Start Discharging</button>
+        </div>
+      </div>
+      <button class="btn-stop" id="btn-stop">■ STOP</button>
+    </div>
+    <script>
+      let lastSoc = null,
+        dischargeStart = null,
+        dischargeTarget = null,
+        discharging = false;
+
+      function batteryColor(soc) {
+        return soc > 50 ? "#00ff88" : soc > 20 ? "#ffaa00" : "#ff4444";
+      }
+
+      function updateBattery(soc) {
+        const fill = document.getElementById("batt-fill");
+        fill.setAttribute(
+          "width",
+          Math.min(102, Math.max(0, (soc / 100) * 102)),
+        );
+        fill.style.fill = batteryColor(soc);
+        document.getElementById("batt-text").textContent = soc.toFixed(1) + "%";
+      }
+
+      function updateDisplay(d) {
+        const soc = parseFloat(d.soc),
+          voltage = parseFloat(d.voltage),
+          current = parseFloat(d.current),
+          temp = parseFloat(d.temp);
+        if (!isNaN(soc)) {
+          lastSoc = soc;
+          updateBattery(soc);
+          const pct = soc.toFixed(1);
+          document.getElementById("charge-soc").innerHTML =
+            pct + "<span> %</span>";
+          document.getElementById("discharge-soc").innerHTML =
+            pct + "<span> %</span>";
+        }
+        if (!isNaN(voltage))
+          document.getElementById("voltage").textContent =
+            voltage.toFixed(1) + "V";
+        if (!isNaN(temp))
+          document.getElementById("temp").textContent = temp.toFixed(1) + "°C";
+        if (!isNaN(current)) {
+          const el = document.getElementById("current");
+          if (current > 0.05) {
+            el.textContent = "+" + current.toFixed(1) + "A";
+            el.className = "val positive";
+          } else if (current < -0.05) {
+            el.textContent = current.toFixed(1) + "A";
+            el.className = "val negative";
+          } else {
+            el.textContent = "0.0A";
+            el.className = "val";
+          }
+        }
+        if (d.cycles != null)
+          document.getElementById("cycles").textContent = Math.round(d.cycles);
+        const connected = d.source === "fpga";
+        document.getElementById("conn-dot").className =
+          "conn-dot" + (connected ? " connected" : "");
+        document.getElementById("conn-label").textContent = connected
+          ? "FPGA CONNECTED"
+          : "FPGA IDLE";
+        const badge = document.getElementById("mode-badge");
+        const btnC = document.getElementById("btn-charge");
+        const btnD = document.getElementById("btn-discharge");
+        if (!isNaN(current) && current > 0.05) {
+          badge.textContent = "CHARGING";
+          badge.className = "mode-badge charging";
+          btnC.className = "btn charge-active";
+          if (!discharging) btnD.className = "btn";
+        } else if (!isNaN(current) && current < -0.05) {
+          badge.textContent = "DISCHARGING";
+          badge.className = "mode-badge discharging";
+          btnD.className = "btn discharge-active";
+          btnC.className = "btn";
+        } else {
+          badge.textContent = "IDLE";
+          badge.className = "mode-badge";
+          if (!discharging) {
+            btnC.className = "btn";
+            btnD.className = "btn";
+          }
+        }
+
+        if (
+          discharging &&
+          dischargeStart !== null &&
+          dischargeTarget !== null &&
+          !isNaN(soc)
+        ) {
+          const discharged = dischargeStart - soc;
+          const remaining = Math.max(0, dischargeTarget - discharged);
+          const prog = document.getElementById("discharge-progress");
+          prog.className = "panel-progress active";
+          prog.textContent = `Discharged ${discharged.toFixed(1)}% of ${dischargeTarget}% — ${remaining.toFixed(1)}% remaining`;
+          if (discharged >= dischargeTarget) {
+            sendCommand("STOP", 0);
+            discharging = false;
+            dischargeStart = null;
+            dischargeTarget = null;
+            prog.className = "panel-progress";
+            prog.textContent = "Discharge complete ✓";
+            btnD.className = "btn";
+          }
+        }
+      }
+
+      async function fetchData() {
+        try {
+          const res = await fetch("/data");
+          if (!res.ok) return;
+          updateDisplay(await res.json());
+        } catch (_) {}
+      }
+
+      async function sendCommand(command, delta = 0) {
+        try {
+          await fetch("/api/command", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command, delta }),
+          });
+        } catch (_) {}
+      }
+
+      document.getElementById("btn-charge").addEventListener("click", () => {
+        discharging = false;
+        dischargeStart = null;
+        dischargeTarget = null;
+        document.getElementById("discharge-progress").textContent = "";
+        document.getElementById("discharge-progress").className =
+          "panel-progress";
+        sendCommand("CHARGE_START", 0);
+      });
+
+      document.getElementById("btn-discharge").addEventListener("click", () => {
+        const amt = parseFloat(document.getElementById("discharge-amt").value);
+        const prog = document.getElementById("discharge-progress");
+        if (isNaN(amt) || amt <= 0) {
+          prog.textContent = "Enter a valid % to discharge.";
+          prog.className = "panel-progress active";
+          return;
+        }
+        if (lastSoc !== null && amt >= lastSoc) {
+          prog.textContent = "Target exceeds current SOC.";
+          prog.className = "panel-progress active";
+          return;
+        }
+        dischargeStart = lastSoc;
+        dischargeTarget = amt;
+        discharging = true;
+        prog.textContent = `Starting discharge — target: -${amt}%`;
+        prog.className = "panel-progress active";
+        sendCommand("DISCHARGE_START", amt);
+      });
+
+      document.getElementById("btn-stop").addEventListener("click", () => {
+        discharging = false;
+        dischargeStart = null;
+        dischargeTarget = null;
+        document.getElementById("discharge-progress").textContent = "";
+        document.getElementById("discharge-progress").className =
+          "panel-progress";
+        sendCommand("STOP", 0);
+      });
+
+      fetchData();
+      setInterval(fetchData, 1000);
+    </script>
+  </body>
+</html>
+
+Code 2: Backend (Express.js & TypeScript)
+
+This code implements a backend server that acts as an interface between the FPGA/BMS hardware and the web dashboard. It receives battery data from the FPGA, stores the latest battery status, and provides APIs for monitoring and control. The server also manages charging, discharging, and stop commands sent from the dashboard and makes them available for the FPGA to execute.
+
+import { Router, type IRouter, type Request, type Response } from "express";
+import healthRouter from "./health";
+
+const router: IRouter = Router();
+router.use(healthRouter);
+
+export let bmsData: Record<string, unknown> = {
+  soc: 85.0,
+  voltage: 59.4,
+  current: 0.0,
+  temp: 34.0,
+  source: "waiting",
+};
+
+export let pendingCmd: Record<string, unknown> = { command: "none" };
+
+router.post("/bms-data", (req: Request, res: Response) => {
+  const d = req.body || {};
+  bmsData = { ...bmsData, ...d, source: "fpga" };
+  res.json({ ok: true });
+});
+
+router.post("/command", (req: Request, res: Response) => {
+  pendingCmd = req.body || { command: "none" };
+  res.json({ ok: true });
+});
+
+router.get("/command", (req: Request, res: Response) => {
+  const cmd = pendingCmd;
+  pendingCmd = { command: "none" };
+  res.json(cmd);
+});
+
+export default router;
