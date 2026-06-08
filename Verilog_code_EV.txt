@@ -1,0 +1,1165 @@
+// ============================================================
+// Module: pwm_generator.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: High-frequency PWM generator for SiC MOSFET switching
+//              Supports variable duty cycle for DAB converter and inverter
+// ============================================================
+
+module pwm_generator #(
+    parameter CLK_FREQ    = 100_000_000,  // 100 MHz system clock
+    parameter PWM_FREQ    = 100_000,      // 100 kHz switching frequency
+    parameter DEAD_TIME_NS = 200          // 200 ns dead time between H/L
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        enable,
+    input  wire [9:0]  duty_cycle,        // 0–1023 (10-bit resolution)
+    input  wire        mode,              // 0 = H2V charging, 1 = V2H discharge
+
+    output reg         pwm_high,          // High-side gate drive
+    output reg         pwm_low,           // Low-side gate drive
+    output reg         pwm_phase_b_high,  // Phase B high-side
+    output reg         pwm_phase_b_low    // Phase B low-side
+);
+
+    // ── Parameters ──────────────────────────────────────────
+    localparam PERIOD     = CLK_FREQ / PWM_FREQ;         // Clock counts per PWM period
+    localparam DEAD_TICKS = (CLK_FREQ / 1_000_000_000) * DEAD_TIME_NS; // Dead time in ticks
+
+    // ── Internal Registers ──────────────────────────────────
+    reg [15:0] counter;
+    reg [15:0] compare_val;
+    reg [15:0] dead_counter;
+    reg        raw_pwm;
+    reg        prev_raw_pwm;
+
+    // ── Duty Cycle to Compare Value ──────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            compare_val <= 0;
+        else
+            compare_val <= (PERIOD * duty_cycle) >> 10; // scale duty_cycle/1024
+    end
+
+    // ── PWM Counter ─────────────────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            counter <= 0;
+        else if (!enable)
+            counter <= 0;
+        else if (counter >= PERIOD - 1)
+            counter <= 0;
+        else
+            counter <= counter + 1;
+    end
+
+    // ── Raw PWM Signal ──────────────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            raw_pwm <= 0;
+        else
+            raw_pwm <= (counter < compare_val) ? 1'b1 : 1'b0;
+    end
+
+    // ── Dead Time Insertion ──────────────────────────────────
+    // Prevents shoot-through in H-bridge by ensuring both
+    // high and low side are never ON at the same time
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pwm_high     <= 0;
+            pwm_low      <= 0;
+            prev_raw_pwm <= 0;
+            dead_counter <= 0;
+        end else if (!enable) begin
+            pwm_high     <= 0;
+            pwm_low      <= 0;
+            dead_counter <= 0;
+        end else begin
+            prev_raw_pwm <= raw_pwm;
+
+            // Rising edge detected — insert dead time before turning HIGH on
+            if (raw_pwm && !prev_raw_pwm) begin
+                pwm_low      <= 0;
+                dead_counter <= DEAD_TICKS;
+            end
+            // Falling edge detected — insert dead time before turning LOW on
+            else if (!raw_pwm && prev_raw_pwm) begin
+                pwm_high     <= 0;
+                dead_counter <= DEAD_TICKS;
+            end
+            // Dead time counting
+            else if (dead_counter > 0) begin
+                dead_counter <= dead_counter - 1;
+                if (dead_counter == 1) begin
+                    pwm_high <= raw_pwm;
+                    pwm_low  <= ~raw_pwm;
+                end
+            end else begin
+                pwm_high <= raw_pwm;
+                pwm_low  <= ~raw_pwm;
+            end
+        end
+    end
+
+    // ── Phase B (180 degrees shifted for DAB converter) ─────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pwm_phase_b_high <= 0;
+            pwm_phase_b_low  <= 0;
+        end else if (!enable) begin
+            pwm_phase_b_high <= 0;
+            pwm_phase_b_low  <= 0;
+        end else begin
+            // Phase B is 180 degrees shifted (inverted) from Phase A
+            // Used for the secondary side of Dual Active Bridge
+            pwm_phase_b_high <= pwm_low;
+            pwm_phase_b_low  <= pwm_high;
+        end
+    end
+
+endmodule
+
+// ============================================================
+// Module: ev_fsm.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: Main Finite State Machine controlling all mode transitions
+//              States: IDLE, INIT, H2V_CHARGE, V2H_DISCHARGE, FAULT, RESET
+// ============================================================
+
+module ev_fsm (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // Command inputs from VexRiscv CPU via AXI bus
+    input  wire        cmd_charge,        // Start H2V charging
+    input  wire        cmd_discharge,     // Start V2H discharging
+    input  wire        cmd_stop,          // Stop all operations
+    input  wire        cmd_fault_clear,   // Clear fault and return to IDLE
+
+    // Safety inputs from Protection module
+    input  wire        fault_overvoltage,
+    input  wire        fault_undervoltage,
+    input  wire        fault_overcurrent,
+    input  wire        fault_overtemp,
+    input  wire        fault_grid_loss,
+
+    // Condition inputs
+    input  wire        ev_connected,      // EV plugged in via CCS2
+    input  wire        grid_synced,       // Grid sync confirmed
+    input  wire        bms_ready,         // BMS data valid and within limits
+    input  wire        soc_full,          // SoC >= 95%
+    input  wire        soc_empty,         // SoC <= 10%
+
+    // Outputs
+    output reg  [2:0]  state,             // Current state (for CPU to read)
+    output reg         relay_h2v,         // Enable H2V power relay
+    output reg         relay_v2h,         // Enable V2H power relay
+    output reg         pwm_enable,        // Enable PWM switching
+    output reg         fault_led,         // Fault indicator
+    output reg         charge_led,        // Charging indicator
+    output reg         discharge_led      // Discharging indicator
+);
+
+    // ── State Encoding ───────────────────────────────────────
+    localparam IDLE         = 3'd0;
+    localparam INIT         = 3'd1;
+    localparam H2V_CHARGE   = 3'd2;
+    localparam V2H_DISCHARGE= 3'd3;
+    localparam FAULT        = 3'd4;
+    localparam RESET_STATE  = 3'd5;
+
+    reg [2:0] current_state, next_state;
+
+    // ── Fault Detection (combinational — instant response) ──
+    wire any_fault = fault_overvoltage | fault_undervoltage |
+                     fault_overcurrent | fault_overtemp    |
+                     fault_grid_loss;
+
+    // ── State Register ───────────────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            current_state <= IDLE;
+        else
+            current_state <= next_state;
+    end
+
+    // ── Next State Logic ─────────────────────────────────────
+    always @(*) begin
+        next_state = current_state;
+
+        case (current_state)
+
+            IDLE: begin
+                if (any_fault)
+                    next_state = FAULT;
+                else if (cmd_charge && ev_connected && bms_ready)
+                    next_state = INIT;
+                else if (cmd_discharge && ev_connected && bms_ready && grid_synced)
+                    next_state = INIT;
+            end
+
+            INIT: begin
+                if (any_fault)
+                    next_state = FAULT;
+                else if (cmd_charge && grid_synced)
+                    next_state = H2V_CHARGE;
+                else if (cmd_discharge && grid_synced)
+                    next_state = V2H_DISCHARGE;
+                else if (cmd_stop)
+                    next_state = IDLE;
+            end
+
+            H2V_CHARGE: begin
+                if (any_fault)
+                    next_state = FAULT;
+                else if (soc_full || cmd_stop)
+                    next_state = IDLE;
+            end
+
+            V2H_DISCHARGE: begin
+                if (any_fault)
+                    next_state = FAULT;
+                else if (soc_empty || cmd_stop)
+                    next_state = IDLE;
+            end
+
+            FAULT: begin
+                if (cmd_fault_clear && !any_fault)
+                    next_state = RESET_STATE;
+            end
+
+            RESET_STATE: begin
+                next_state = IDLE;
+            end
+
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // ── Output Logic ─────────────────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state         <= IDLE;
+            relay_h2v     <= 0;
+            relay_v2h     <= 0;
+            pwm_enable    <= 0;
+            fault_led     <= 0;
+            charge_led    <= 0;
+            discharge_led <= 0;
+        end else begin
+            state <= current_state;
+
+            case (current_state)
+                IDLE: begin
+                    relay_h2v     <= 0;
+                    relay_v2h     <= 0;
+                    pwm_enable    <= 0;
+                    fault_led     <= 0;
+                    charge_led    <= 0;
+                    discharge_led <= 0;
+                end
+
+                INIT: begin
+                    relay_h2v     <= 0;
+                    relay_v2h     <= 0;
+                    pwm_enable    <= 0;
+                    fault_led     <= 0;
+                    charge_led    <= 1; // blink while initialising
+                    discharge_led <= 0;
+                end
+
+                H2V_CHARGE: begin
+                    relay_h2v     <= 1;
+                    relay_v2h     <= 0;
+                    pwm_enable    <= 1;
+                    fault_led     <= 0;
+                    charge_led    <= 1;
+                    discharge_led <= 0;
+                end
+
+                V2H_DISCHARGE: begin
+                    relay_h2v     <= 0;
+                    relay_v2h     <= 1;
+                    pwm_enable    <= 1;
+                    fault_led     <= 0;
+                    charge_led    <= 0;
+                    discharge_led <= 1;
+                end
+
+                FAULT: begin
+                    relay_h2v     <= 0;  // Immediately kill all relays
+                    relay_v2h     <= 0;
+                    pwm_enable    <= 0;  // Stop PWM switching
+                    fault_led     <= 1;
+                    charge_led    <= 0;
+                    discharge_led <= 0;
+                end
+
+                RESET_STATE: begin
+                    relay_h2v     <= 0;
+                    relay_v2h     <= 0;
+                    pwm_enable    <= 0;
+                    fault_led     <= 0;
+                    charge_led    <= 0;
+                    discharge_led <= 0;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+
+// ============================================================
+// Module: grid_sync.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: Grid synchronisation using zero-crossing detection
+//              Measures grid frequency and phase for inverter alignment
+// ============================================================
+
+module grid_sync #(
+    parameter CLK_FREQ   = 100_000_000,   // 100 MHz
+    parameter GRID_FREQ  = 50,            // 50 Hz grid
+    parameter PHASE_TOL  = 50            // Phase tolerance in clock ticks
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // Zero crossing detector output (from ZMPT101B + comparator)
+    input  wire        zcd_input,         // Goes HIGH at every zero crossing
+
+    // Inverter output zero crossing (from feedback ADC)
+    input  wire        inv_zcd_input,
+
+    output reg         grid_synced,       // HIGH when phase is aligned
+    output reg  [31:0] grid_period,       // Measured grid period in clock ticks
+    output reg  [15:0] phase_error,       // Phase difference in clock ticks
+    output reg  [7:0]  grid_frequency,    // Measured frequency in Hz
+    output reg         grid_present       // Grid voltage detected
+);
+
+    // ── Parameters ──────────────────────────────────────────
+    localparam EXPECTED_PERIOD = CLK_FREQ / GRID_FREQ; // 2,000,000 ticks at 50Hz
+
+    // ── Internal signals ────────────────────────────────────
+    reg        zcd_prev, inv_zcd_prev;
+    reg [31:0] zcd_counter;        // Counts clocks between zero crossings
+    reg [31:0] inv_zcd_counter;
+    reg [31:0] period_capture;
+    reg [15:0] phase_diff;
+    reg        zcd_rising;
+    reg        inv_zcd_rising;
+
+    // ── Edge Detection ───────────────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            zcd_prev     <= 0;
+            inv_zcd_prev <= 0;
+        end else begin
+            zcd_prev     <= zcd_input;
+            inv_zcd_prev <= inv_zcd_input;
+        end
+    end
+
+    assign zcd_rising     = zcd_input     & ~zcd_prev;
+    assign inv_zcd_rising = inv_zcd_input & ~inv_zcd_prev;
+
+    // ── Grid Period Measurement ──────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            zcd_counter    <= 0;
+            grid_period    <= EXPECTED_PERIOD;
+            grid_frequency <= GRID_FREQ;
+            grid_present   <= 0;
+        end else begin
+            if (zcd_rising) begin
+                // Two zero crossings = one half period, so full period = 2x
+                period_capture <= zcd_counter * 2;
+                grid_period    <= zcd_counter * 2;
+
+                // Frequency = CLK_FREQ / period
+                if (zcd_counter > 0)
+                    grid_frequency <= CLK_FREQ / (zcd_counter * 2);
+
+                // Valid grid: period within ±5% of expected
+                if ((zcd_counter * 2 > (EXPECTED_PERIOD * 95 / 100)) &&
+                    (zcd_counter * 2 < (EXPECTED_PERIOD * 105 / 100)))
+                    grid_present <= 1;
+                else
+                    grid_present <= 0;
+
+                zcd_counter <= 0;
+            end else begin
+                zcd_counter <= zcd_counter + 1;
+
+                // If no crossing seen for 2x expected period → grid lost
+                if (zcd_counter > EXPECTED_PERIOD * 2) begin
+                    grid_present <= 0;
+                    grid_synced  <= 0;
+                end
+            end
+        end
+    end
+
+    // ── Phase Error Measurement ──────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            inv_zcd_counter <= 0;
+            phase_error     <= 0;
+            grid_synced     <= 0;
+        end else begin
+            if (zcd_rising) begin
+                inv_zcd_counter <= 0;
+            end else if (inv_zcd_rising) begin
+                // Phase error = time between grid ZC and inverter ZC
+                phase_diff  <= inv_zcd_counter[15:0];
+                phase_error <= inv_zcd_counter[15:0];
+
+                // Synced if phase error is within tolerance
+                if (inv_zcd_counter <= PHASE_TOL && grid_present)
+                    grid_synced <= 1;
+                else
+                    grid_synced <= 0;
+            end else begin
+                inv_zcd_counter <= inv_zcd_counter + 1;
+            end
+        end
+    end
+
+endmodule
+
+// ============================================================
+// Module: uart_controller.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: Full UART RX/TX controller for BMS communication
+//              Supports 9600, 19200, 115200 baud rates
+// ============================================================
+
+module uart_controller #(
+    parameter CLK_FREQ  = 100_000_000,
+    parameter BAUD_RATE = 115200
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // RX — receive from BMS
+    input  wire        rx,
+    output reg  [7:0]  rx_data,
+    output reg         rx_valid,      // Pulses HIGH for 1 clock when byte received
+
+    // TX — send commands to BMS
+    input  wire [7:0]  tx_data,
+    input  wire        tx_start,
+    output reg         tx,
+    output reg         tx_busy
+);
+
+    // ── Baud Rate Generator ──────────────────────────────────
+    localparam BAUD_DIV    = CLK_FREQ / BAUD_RATE;
+    localparam BAUD_DIV_H  = BAUD_DIV / 2;   // Half period for RX sampling
+
+    // ── RX State Machine ─────────────────────────────────────
+    localparam RX_IDLE  = 2'd0;
+    localparam RX_START = 2'd1;
+    localparam RX_DATA  = 2'd2;
+    localparam RX_STOP  = 2'd3;
+
+    reg [1:0]  rx_state;
+    reg [15:0] rx_baud_cnt;
+    reg [3:0]  rx_bit_cnt;
+    reg [7:0]  rx_shift;
+    reg        rx_sync1, rx_sync2;  // 2-FF synchroniser for metastability
+
+    // Synchronise RX input to clock domain
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_sync1 <= 1;
+            rx_sync2 <= 1;
+        end else begin
+            rx_sync1 <= rx;
+            rx_sync2 <= rx_sync1;
+        end
+    end
+
+    // RX State Machine
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_state   <= RX_IDLE;
+            rx_baud_cnt <= 0;
+            rx_bit_cnt  <= 0;
+            rx_shift    <= 0;
+            rx_data     <= 0;
+            rx_valid    <= 0;
+        end else begin
+            rx_valid <= 0; // Default: no valid data
+
+            case (rx_state)
+                RX_IDLE: begin
+                    if (!rx_sync2) begin      // Detect start bit (line goes LOW)
+                        rx_state    <= RX_START;
+                        rx_baud_cnt <= BAUD_DIV_H; // Wait half bit period to sample middle
+                    end
+                end
+
+                RX_START: begin
+                    if (rx_baud_cnt == 0) begin
+                        if (!rx_sync2) begin   // Confirm start bit still low
+                            rx_state    <= RX_DATA;
+                            rx_baud_cnt <= BAUD_DIV;
+                            rx_bit_cnt  <= 0;
+                        end else begin
+                            rx_state <= RX_IDLE; // False start
+                        end
+                    end else begin
+                        rx_baud_cnt <= rx_baud_cnt - 1;
+                    end
+                end
+
+                RX_DATA: begin
+                    if (rx_baud_cnt == 0) begin
+                        rx_shift    <= {rx_sync2, rx_shift[7:1]}; // LSB first
+                        rx_bit_cnt  <= rx_bit_cnt + 1;
+                        rx_baud_cnt <= BAUD_DIV;
+
+                        if (rx_bit_cnt == 7) begin
+                            rx_state <= RX_STOP;
+                        end
+                    end else begin
+                        rx_baud_cnt <= rx_baud_cnt - 1;
+                    end
+                end
+
+                RX_STOP: begin
+                    if (rx_baud_cnt == 0) begin
+                        if (rx_sync2) begin    // Valid stop bit (HIGH)
+                            rx_data  <= rx_shift;
+                            rx_valid <= 1;
+                        end
+                        rx_state <= RX_IDLE;
+                    end else begin
+                        rx_baud_cnt <= rx_baud_cnt - 1;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // ── TX State Machine ─────────────────────────────────────
+    localparam TX_IDLE  = 2'd0;
+    localparam TX_START = 2'd1;
+    localparam TX_DATA  = 2'd2;
+    localparam TX_STOP  = 2'd3;
+
+    reg [1:0]  tx_state;
+    reg [15:0] tx_baud_cnt;
+    reg [3:0]  tx_bit_cnt;
+    reg [7:0]  tx_shift;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx_state    <= TX_IDLE;
+            tx          <= 1;          // Idle state is HIGH
+            tx_busy     <= 0;
+            tx_baud_cnt <= 0;
+            tx_bit_cnt  <= 0;
+            tx_shift    <= 0;
+        end else begin
+            case (tx_state)
+                TX_IDLE: begin
+                    tx      <= 1;
+                    tx_busy <= 0;
+                    if (tx_start) begin
+                        tx_shift    <= tx_data;
+                        tx_state    <= TX_START;
+                        tx_baud_cnt <= BAUD_DIV;
+                        tx_busy     <= 1;
+                        tx          <= 0;   // Start bit
+                    end
+                end
+
+                TX_START: begin
+                    if (tx_baud_cnt == 0) begin
+                        tx_state    <= TX_DATA;
+                        tx_baud_cnt <= BAUD_DIV;
+                        tx_bit_cnt  <= 0;
+                        tx          <= tx_shift[0];
+                        tx_shift    <= {1'b0, tx_shift[7:1]};
+                    end else begin
+                        tx_baud_cnt <= tx_baud_cnt - 1;
+                    end
+                end
+
+                TX_DATA: begin
+                    if (tx_baud_cnt == 0) begin
+                        tx_bit_cnt  <= tx_bit_cnt + 1;
+                        tx_baud_cnt <= BAUD_DIV;
+
+                        if (tx_bit_cnt == 7) begin
+                            tx_state <= TX_STOP;
+                            tx       <= 1;  // Stop bit
+                        end else begin
+                            tx       <= tx_shift[0];
+                            tx_shift <= {1'b0, tx_shift[7:1]};
+                        end
+                    end else begin
+                        tx_baud_cnt <= tx_baud_cnt - 1;
+                    end
+                end
+
+                TX_STOP: begin
+                    if (tx_baud_cnt == 0) begin
+                        tx_state <= TX_IDLE;
+                        tx       <= 1;
+                    end else begin
+                        tx_baud_cnt <= tx_baud_cnt - 1;
+                    end
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+// ============================================================
+// Module: protection.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: Hardware fast-trip protection module
+//              Monitors all live parameters every clock cycle
+//              Trips relay instantly without waiting for software
+//              All limits derived from ML model outputs
+// ============================================================
+
+module protection #(
+    // ── ML-Derived Safe Limits (embedded from trained model) ──
+    // These values come from Random Forest + XGBoost training
+    parameter VOLT_MAX      = 16'd680,    // Max pack voltage (68.0V * 10)
+    parameter VOLT_MIN      = 16'd420,    // Min pack voltage (42.0V * 10)
+    parameter CURR_MAX      = 16'd300,    // Max current (30.0A * 10)
+    parameter TEMP_MAX      = 16'd450,    // Max temperature (45.0°C * 10)
+    parameter TEMP_MIN      = 16'd50,     // Min temperature (5.0°C * 10)
+    parameter SOC_MAX       = 16'd950,    // Max SoC 95% (950/1000)
+    parameter SOC_MIN       = 16'd100,    // Min SoC 10% (100/1000)
+    parameter SOH_MIN       = 16'd600,    // Min SoH 60% (600/1000)
+    parameter FAULT_HOLD    = 20         // Clock cycles to hold fault (debounce)
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // Live BMS readings (fixed-point, scaled x10)
+    input  wire [15:0] pack_voltage,      // e.g. 596 = 59.6V
+    input  wire [15:0] pack_current,      // e.g. 183 = 18.3A
+    input  wire [15:0] temperature,       // e.g. 340 = 34.0°C
+    input  wire [15:0] soc,               // e.g. 850 = 85.0%
+    input  wire [15:0] soh,               // e.g. 914 = 91.4%
+    input  wire        grid_present,      // From grid sync module
+
+    // Individual fault flags
+    output reg         fault_overvoltage,
+    output reg         fault_undervoltage,
+    output reg         fault_overcurrent,
+    output reg         fault_overtemp,
+    output reg         fault_undertemp,
+    output reg         fault_soc_high,
+    output reg         fault_soc_low,
+    output reg         fault_soh_low,
+    output reg         fault_grid_loss,
+
+    // Combined fault — directly drives relay open
+    output reg         fault_any,
+
+    // Status
+    output reg  [8:0]  fault_code        // Bitmask of active faults
+);
+
+    // ── Debounce counters ────────────────────────────────────
+    reg [4:0] ov_cnt, uv_cnt, oc_cnt, ot_cnt, ut_cnt;
+    reg [4:0] sh_cnt, sl_cnt, soh_cnt, gl_cnt;
+
+    // ── Raw fault signals (combinational) ───────────────────
+    wire raw_ov  = (pack_voltage  > VOLT_MAX);
+    wire raw_uv  = (pack_voltage  < VOLT_MIN);
+    wire raw_oc  = (pack_current  > CURR_MAX);
+    wire raw_ot  = (temperature   > TEMP_MAX);
+    wire raw_ut  = (temperature   < TEMP_MIN);
+    wire raw_sh  = (soc           > SOC_MAX);
+    wire raw_sl  = (soc           < SOC_MIN);
+    wire raw_soh = (soh           < SOH_MIN);
+    wire raw_gl  = !grid_present;
+
+    // ── Debounced Fault Detection ────────────────────────────
+    // Avoids false trips from momentary noise on sensor lines
+    task debounce_fault;
+        input      raw;
+        inout [4:0] cnt;
+        output reg  fault_out;
+        begin
+            if (raw) begin
+                if (cnt < FAULT_HOLD)
+                    cnt = cnt + 1;
+                if (cnt >= FAULT_HOLD)
+                    fault_out = 1;
+            end else begin
+                cnt       = 0;
+                fault_out = 0;
+            end
+        end
+    endtask
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fault_overvoltage  <= 0;
+            fault_undervoltage <= 0;
+            fault_overcurrent  <= 0;
+            fault_overtemp     <= 0;
+            fault_undertemp    <= 0;
+            fault_soc_high     <= 0;
+            fault_soc_low      <= 0;
+            fault_soh_low      <= 0;
+            fault_grid_loss    <= 0;
+            fault_any          <= 0;
+            fault_code         <= 0;
+            ov_cnt  <= 0; uv_cnt  <= 0; oc_cnt  <= 0;
+            ot_cnt  <= 0; ut_cnt  <= 0; sh_cnt  <= 0;
+            sl_cnt  <= 0; soh_cnt <= 0; gl_cnt  <= 0;
+        end else begin
+            // Debounce each fault
+            debounce_fault(raw_ov,  ov_cnt,  fault_overvoltage);
+            debounce_fault(raw_uv,  uv_cnt,  fault_undervoltage);
+            debounce_fault(raw_oc,  oc_cnt,  fault_overcurrent);
+            debounce_fault(raw_ot,  ot_cnt,  fault_overtemp);
+            debounce_fault(raw_ut,  ut_cnt,  fault_undertemp);
+            debounce_fault(raw_sh,  sh_cnt,  fault_soc_high);
+            debounce_fault(raw_sl,  sl_cnt,  fault_soc_low);
+            debounce_fault(raw_soh, soh_cnt, fault_soh_low);
+            debounce_fault(raw_gl,  gl_cnt,  fault_grid_loss);
+
+            // Combined fault
+            fault_any <= fault_overvoltage | fault_undervoltage |
+                         fault_overcurrent | fault_overtemp     |
+                         fault_undertemp   | fault_soc_high     |
+                         fault_soc_low     | fault_soh_low      |
+                         fault_grid_loss;
+
+            // Fault code bitmask for CPU to read via AXI
+            fault_code <= {fault_grid_loss,   fault_soh_low,
+                           fault_soc_low,     fault_soc_high,
+                           fault_undertemp,   fault_overtemp,
+                           fault_overcurrent, fault_undervoltage,
+                           fault_overvoltage};
+        end
+    end
+
+endmodule
+
+// ============================================================
+// Module: bms_indication.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: BMS status indication — LED blink patterns and
+//              buzzer alerts based on SoC, SoH, fault and mode
+// ============================================================
+
+module bms_indication #(
+    parameter CLK_FREQ   = 100_000_000,   // 100 MHz
+    parameter BLINK_SLOW = 50_000_000,    // 0.5 Hz — slow blink (1s on/off)
+    parameter BLINK_FAST = 10_000_000     // 5 Hz  — fast blink (fault alert)
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // BMS live inputs
+    input  wire [15:0] soc,               // e.g. 850 = 85.0%
+    input  wire [15:0] soh,               // e.g. 914 = 91.4%
+    input  wire [15:0] temperature,       // e.g. 340 = 34.0°C
+    input  wire [15:0] pack_voltage,
+    input  wire [15:0] pack_current,
+
+    // System state inputs
+    input  wire        fault_any,
+    input  wire        charging_active,   // H2V mode active
+    input  wire        discharging_active,// V2H mode active
+    input  wire        grid_synced,
+
+    // LED outputs
+    output reg         led_soc_high,      // GREEN  — SoC > 75%
+    output reg         led_soc_mid,       // YELLOW — SoC 25–75%
+    output reg         led_soc_low,       // RED    — SoC < 25%
+    output reg         led_charging,      // BLUE   — charging active
+    output reg         led_discharging,   // WHITE  — discharging active
+    output reg         led_fault,         // RED FAST BLINK — fault
+    output reg         led_soh_warn,      // YELLOW BLINK — SoH < 70%
+    output reg         led_grid,          // GREEN steady — grid synced
+
+    // Buzzer output
+    output reg         buzzer             // Active HIGH
+);
+
+    // ── Blink Counters ───────────────────────────────────────
+    reg [31:0] slow_cnt;
+    reg [31:0] fast_cnt;
+    reg        slow_tick;
+    reg        fast_tick;
+
+    // Slow blink generator (0.5 Hz)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            slow_cnt  <= 0;
+            slow_tick <= 0;
+        end else begin
+            if (slow_cnt >= BLINK_SLOW - 1) begin
+                slow_cnt  <= 0;
+                slow_tick <= ~slow_tick;
+            end else begin
+                slow_cnt <= slow_cnt + 1;
+            end
+        end
+    end
+
+    // Fast blink generator (5 Hz)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fast_cnt  <= 0;
+            fast_tick <= 0;
+        end else begin
+            if (fast_cnt >= BLINK_FAST - 1) begin
+                fast_cnt  <= 0;
+                fast_tick <= ~fast_tick;
+            end else begin
+                fast_cnt <= fast_cnt + 1;
+            end
+        end
+    end
+
+    // ── SoC Thresholds ───────────────────────────────────────
+    // SoC values scaled x10 (e.g. 750 = 75.0%)
+    localparam SOC_HIGH_TH  = 16'd750;   // 75%
+    localparam SOC_LOW_TH   = 16'd250;   // 25%
+    localparam SOH_WARN_TH  = 16'd700;   // 70%
+    localparam TEMP_WARN_TH = 16'd400;   // 40°C
+
+    // ── LED and Buzzer Logic ─────────────────────────────────
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            led_soc_high    <= 0;
+            led_soc_mid     <= 0;
+            led_soc_low     <= 0;
+            led_charging    <= 0;
+            led_discharging <= 0;
+            led_fault       <= 0;
+            led_soh_warn    <= 0;
+            led_grid        <= 0;
+            buzzer          <= 0;
+        end else begin
+
+            // ── Fault overrides everything ───────────────────
+            if (fault_any) begin
+                led_fault       <= fast_tick;  // Fast blink on fault
+                led_soc_high    <= 0;
+                led_soc_mid     <= 0;
+                led_soc_low     <= 0;
+                led_charging    <= 0;
+                led_discharging <= 0;
+                led_soh_warn    <= 0;
+                led_grid        <= 0;
+                buzzer          <= fast_tick;  // Buzzer beeps fast on fault
+
+            end else begin
+                led_fault <= 0;
+
+                // ── SoC indication ───────────────────────────
+                if (soc >= SOC_HIGH_TH) begin
+                    led_soc_high <= 1;
+                    led_soc_mid  <= 0;
+                    led_soc_low  <= 0;
+                end else if (soc >= SOC_LOW_TH) begin
+                    led_soc_high <= 0;
+                    led_soc_mid  <= 1;
+                    led_soc_low  <= 0;
+                end else begin
+                    led_soc_high <= 0;
+                    led_soc_mid  <= 0;
+                    led_soc_low  <= slow_tick; // Blink when critically low
+                end
+
+                // ── Charging / Discharging LEDs ──────────────
+                led_charging    <= charging_active;
+                led_discharging <= discharging_active;
+
+                // ── SoH Warning ──────────────────────────────
+                if (soh < SOH_WARN_TH)
+                    led_soh_warn <= slow_tick; // Slow blink = battery aging
+                else
+                    led_soh_warn <= 0;
+
+                // ── Grid LED ─────────────────────────────────
+                led_grid <= grid_synced;
+
+                // ── Buzzer logic ─────────────────────────────
+                // Beep once when SoC critically low
+                if (soc < 16'd150)           // Below 15%
+                    buzzer <= slow_tick;
+                // Beep when temperature high
+                else if (temperature > TEMP_WARN_TH)
+                    buzzer <= slow_tick;
+                else
+                    buzzer <= 0;
+
+            end
+        end
+    end
+
+endmodule
+
+// ============================================================
+// Module: top.v
+// Project: FPGA-Based Intelligent Bidirectional EV Charging Controller
+// Description: Top-level module integrating all submodules:
+//              pwm_generator, ev_fsm, grid_sync,
+//              uart_controller, protection, bms_indication
+// ============================================================
+
+module top #(
+    parameter CLK_FREQ     = 100_000_000,
+    parameter PWM_FREQ     = 100_000,
+    parameter DEAD_TIME_NS = 200,
+    parameter BAUD_RATE    = 115200,
+    parameter GRID_FREQ    = 50,
+    parameter PHASE_TOL    = 50
+)(
+    // ── System ───────────────────────────────────────────────
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // ── CPU Commands (from VexRiscv via AXI) ─────────────────
+    input  wire        cmd_charge,
+    input  wire        cmd_discharge,
+    input  wire        cmd_stop,
+    input  wire        cmd_fault_clear,
+    input  wire [9:0]  duty_cycle,
+
+    // ── Grid Sync Inputs ──────────────────────────────────────
+    input  wire        zcd_input,         // Grid zero crossing detector
+    input  wire        inv_zcd_input,     // Inverter zero crossing feedback
+
+    // ── UART (BMS Communication) ──────────────────────────────
+    input  wire        uart_rx,
+    output wire        uart_tx,
+
+    // ── BMS Live Data (parsed by CPU, passed to protection) ──
+    input  wire [15:0] pack_voltage,
+    input  wire [15:0] pack_current,
+    input  wire [15:0] temperature,
+    input  wire [15:0] soc,
+    input  wire [15:0] soh,
+
+    // ── EV Connection ─────────────────────────────────────────
+    input  wire        ev_connected,
+    input  wire        bms_ready,
+
+    // ── PWM Gate Drive Outputs ────────────────────────────────
+    output wire        pwm_high,
+    output wire        pwm_low,
+    output wire        pwm_phase_b_high,
+    output wire        pwm_phase_b_low,
+
+    // ── Relay Outputs ─────────────────────────────────────────
+    output wire        relay_h2v,
+    output wire        relay_v2h,
+
+    // ── LED Indicators ────────────────────────────────────────
+    output wire        led_soc_high,
+    output wire        led_soc_mid,
+    output wire        led_soc_low,
+    output wire        led_charging,
+    output wire        led_discharging,
+    output wire        led_fault,
+    output wire        led_soh_warn,
+    output wire        led_grid,
+
+    // ── Buzzer ────────────────────────────────────────────────
+    output wire        buzzer,
+
+    // ── Debug/Status ──────────────────────────────────────────
+    output wire [2:0]  fsm_state,
+    output wire [8:0]  fault_code,
+    output wire [31:0] grid_period,
+    output wire [15:0] phase_error,
+    output wire [7:0]  grid_frequency
+);
+
+    // ════════════════════════════════════════════════════════
+    // Internal Wires
+    // ════════════════════════════════════════════════════════
+
+    // Grid sync outputs
+    wire        grid_synced;
+    wire        grid_present;
+
+    // Protection fault outputs
+    wire        fault_overvoltage;
+    wire        fault_undervoltage;
+    wire        fault_overcurrent;
+    wire        fault_overtemp;
+    wire        fault_undertemp;
+    wire        fault_soc_high;
+    wire        fault_soc_low;
+    wire        fault_soh_low;
+    wire        fault_grid_loss;
+    wire        fault_any;
+
+    // FSM outputs
+    wire        pwm_enable;
+    wire        fsm_fault_led;
+    wire        fsm_charge_led;
+    wire        fsm_discharge_led;
+    wire [2:0]  fsm_state_int;
+
+    // UART outputs
+    wire [7:0]  rx_data;
+    wire        rx_valid;
+    wire        tx_busy;
+
+    // SoC/SoH boundary flags for FSM
+    wire        soc_full  = (soc  >= 16'd950);   // 95%
+    wire        soc_empty = (soc  <= 16'd100);   // 10%
+
+    // ════════════════════════════════════════════════════════
+    // 1. PWM Generator
+    // ════════════════════════════════════════════════════════
+    pwm_generator #(
+        .CLK_FREQ    (CLK_FREQ),
+        .PWM_FREQ    (PWM_FREQ),
+        .DEAD_TIME_NS(DEAD_TIME_NS)
+    ) u_pwm (
+        .clk              (clk),
+        .rst_n            (rst_n),
+        .enable           (pwm_enable),
+        .duty_cycle       (duty_cycle),
+        .mode             (fsm_state_int == 3'd3), // 1 = V2H discharge
+        .pwm_high         (pwm_high),
+        .pwm_low          (pwm_low),
+        .pwm_phase_b_high (pwm_phase_b_high),
+        .pwm_phase_b_low  (pwm_phase_b_low)
+    );
+
+    // ════════════════════════════════════════════════════════
+    // 2. EV FSM
+    // ════════════════════════════════════════════════════════
+    ev_fsm u_fsm (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .cmd_charge         (cmd_charge),
+        .cmd_discharge      (cmd_discharge),
+        .cmd_stop           (cmd_stop),
+        .cmd_fault_clear    (cmd_fault_clear),
+        .fault_overvoltage  (fault_overvoltage),
+        .fault_undervoltage (fault_undervoltage),
+        .fault_overcurrent  (fault_overcurrent),
+        .fault_overtemp     (fault_overtemp),
+        .fault_grid_loss    (fault_grid_loss),
+        .ev_connected       (ev_connected),
+        .grid_synced        (grid_synced),
+        .bms_ready          (bms_ready),
+        .soc_full           (soc_full),
+        .soc_empty          (soc_empty),
+        .state              (fsm_state_int),
+        .relay_h2v          (relay_h2v),
+        .relay_v2h          (relay_v2h),
+        .pwm_enable         (pwm_enable),
+        .fault_led          (fsm_fault_led),
+        .charge_led         (fsm_charge_led),
+        .discharge_led      (fsm_discharge_led)
+    );
+
+    assign fsm_state = fsm_state_int;
+
+    // ════════════════════════════════════════════════════════
+    // 3. Grid Sync
+    // ════════════════════════════════════════════════════════
+    grid_sync #(
+        .CLK_FREQ  (CLK_FREQ),
+        .GRID_FREQ (GRID_FREQ),
+        .PHASE_TOL (PHASE_TOL)
+    ) u_grid (
+        .clk            (clk),
+        .rst_n          (rst_n),
+        .zcd_input      (zcd_input),
+        .inv_zcd_input  (inv_zcd_input),
+        .grid_synced    (grid_synced),
+        .grid_period    (grid_period),
+        .phase_error    (phase_error),
+        .grid_frequency (grid_frequency),
+        .grid_present   (grid_present)
+    );
+
+    // ════════════════════════════════════════════════════════
+    // 4. UART Controller
+    // ════════════════════════════════════════════════════════
+    uart_controller #(
+        .CLK_FREQ  (CLK_FREQ),
+        .BAUD_RATE (BAUD_RATE)
+    ) u_uart (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .rx       (uart_rx),
+        .rx_data  (rx_data),
+        .rx_valid (rx_valid),
+        .tx_data  (8'h00),       // TX driven by CPU — tied off at top level
+        .tx_start (1'b0),
+        .tx       (uart_tx),
+        .tx_busy  (tx_busy)
+    );
+
+    // ════════════════════════════════════════════════════════
+    // 5. Protection Module
+    // ════════════════════════════════════════════════════════
+    protection u_protection (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .pack_voltage       (pack_voltage),
+        .pack_current       (pack_current),
+        .temperature        (temperature),
+        .soc                (soc),
+        .soh                (soh),
+        .grid_present       (grid_present),
+        .fault_overvoltage  (fault_overvoltage),
+        .fault_undervoltage (fault_undervoltage),
+        .fault_overcurrent  (fault_overcurrent),
+        .fault_overtemp     (fault_overtemp),
+        .fault_undertemp    (fault_undertemp),
+        .fault_soc_high     (fault_soc_high),
+        .fault_soc_low      (fault_soc_low),
+        .fault_soh_low      (fault_soh_low),
+        .fault_grid_loss    (fault_grid_loss),
+        .fault_any          (fault_any),
+        .fault_code         (fault_code)
+    );
+
+    // ════════════════════════════════════════════════════════
+    // 6. BMS Indication
+    // ════════════════════════════════════════════════════════
+    bms_indication #(
+        .CLK_FREQ   (CLK_FREQ)
+    ) u_bms_ind (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .soc                (soc),
+        .soh                (soh),
+        .temperature        (temperature),
+        .pack_voltage       (pack_voltage),
+        .pack_current       (pack_current),
+        .fault_any          (fault_any),
+        .charging_active    (fsm_charge_led),
+        .discharging_active (fsm_discharge_led),
+        .grid_synced        (grid_synced),
+        .led_soc_high       (led_soc_high),
+        .led_soc_mid        (led_soc_mid),
+        .led_soc_low        (led_soc_low),
+        .led_charging       (led_charging),
+        .led_discharging    (led_discharging),
+        .led_fault          (led_fault),
+        .led_soh_warn       (led_soh_warn),
+        .led_grid           (led_grid),
+        .buzzer             (buzzer)
+    );
+
+endmodule
